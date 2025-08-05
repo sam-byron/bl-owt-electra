@@ -1,3 +1,4 @@
+import glob
 import os
 import torch
 import json
@@ -52,7 +53,9 @@ def train_loop(
     config,
     checkpoint_path,
     start_epoch,
-    total_tokens_train
+    total_tokens_train,
+    train_subset_index,
+    tqdm_offset=0
 ):
     num_epochs = config["num_epochs"]
     if start_epoch >= num_epochs:
@@ -81,7 +84,7 @@ def train_loop(
             unit_scale=True,
             desc=f"Epoch {epoch+1}/{num_epochs}",
             leave=False,
-            position=0,
+            position=tqdm_offset,
             disable=not is_main,
         )
         # Loss bar (steps)
@@ -89,7 +92,7 @@ def train_loop(
             total=steps_per_epoch,
             desc="Loss",
             leave=False,
-            position=1,
+            position=tqdm_offset + 1,
             bar_format="{l_bar}{bar}| {postfix}",
             disable=not is_main,
         )
@@ -163,6 +166,7 @@ def train_loop(
                             accelerator.save_state(output_dir=checkpoint_path, safe_serialization=False)
                             unwrapped = accelerator.unwrap_model(model)
                             unwrapped.save_pretrained(checkpoint_path)
+                            tokenizer.save_pretrained(checkpoint_path)  # Save tokenizer to cache path
                             print("[Checkpoint] Saved model state and optimizer")
                         accelerator.wait_for_everyone()
                         last_checkpoint_time = current_time
@@ -181,6 +185,7 @@ def train_loop(
             accelerator.save_state(output_dir=checkpoint_path)
             unwrapped = accelerator.unwrap_model(model)
             unwrapped.save_pretrained(checkpoint_path)
+            tokenizer.save_pretrained(checkpoint_path)  # Save tokenizer to cache path
             print("[Checkpoint] Saved model state and optimizer")
 
 
@@ -199,64 +204,64 @@ def main():
     master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
     master_port = os.environ.get("MASTER_PORT", "29500")
 
-
-    # initialize process group with explicit device_id
-    # dist.init_process_group(
-    #     backend="nccl",
-    #     init_method=f"tcp://{master_addr}:{master_port}",
-    #     world_size=world_size,
-    #     rank=local_rank,
-    #     timeout=timedelta(minutes=10),
-    #     # device_id=local_rank,
-    #     device_id=torch.device(f"cuda:{local_rank}"),   # <-- pass a torch.device
-    # )
-    
-    # # You need to tell Accelerate not to “dispatch” the same batch to every rank when using an IterableDataset (or else split each global batch into per‐rank pieces). Two ways to do this:
-    # # Option A) Disable dispatching entirely by passing dispatch_batches=False
-    # dataloader_config = DataLoaderConfiguration(
-    # dispatch_batches=False,  # Each process fetches its own batch
-    # split_batches=True,       # Split fetched batches across processes
-    # )
-    # accelerator = Accelerator(dataloader_config=dataloader_config, gradient_accumulation_steps=1)
-    # accelerator = Accelerator(dynamo_backend="eager")  # use inductor mode for dynamo
-    # dataloader_config = DataLoaderConfiguration(
-    #     split_batches=False,  # Each process fetches its own batch
-    #     dispatch_batches=False,  # Disable dispatching to avoid splitting batches
-    # )
-    # accelerator = Accelerator(dataloader_config)
     accelerator = Accelerator()
     accelerator.even_batches = False  # Disable "even batches" enforcement since we use a batch_sampler without fixed batch_size
 
     parser = argparse.ArgumentParser(description="Chatbot Training Script with Accelerate")
-    parser.add_argument("--config_path", type=str, required=True, help="Path to the configuration file")
+    parser.add_argument(
+        "--config_path", type=str, required=True,
+        help="Path to the configuration file"
+    )
+    parser.add_argument(
+        "--checkpoint_path", type=str, default=None,
+        help="Directory to save to or load from"
+    )
+
+    parser.add_argument(
+        "--tqdm_offset", type=int, default=0,
+        help="line offset for tqdm so multiple bars don't collide"
+    )
     args = parser.parse_args()
 
     with open(args.config_path, "r") as config_file:
         config = json.load(config_file)
 
     checkpoint_path = os.path.join(config["cache_path"], "checkpoint.pt")
+    # decide checkpoint dir: resume existing or create new
+    
     tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
     # tokenizer.pad_token = tokenizer.eos_token
 
-    train_loader, val_loader, test_loader, collate_fn, total_tokens_train = data_loader(config, tokenizer, config["cache_path"])
-    # Build the GPT-2 model from scratch based on our config
+    # get loaders and which subset‐index we're on
+    train_loader, val_loader, test_loader, collate_fn, total_tokens_train, train_subset_index = \
+        data_loader(config, tokenizer, config["cache_path"])
+    if args.checkpoint_path:
+        if not os.path.isdir(args.checkpoint_path):
+            raise ValueError(f"Invalid --checkpoint_path for resume: {args.checkpoint_path}")
+        checkpoint_path = args.checkpoint_path
+        print(f"Resuming from checkpoint: {checkpoint_path}")
+    else:
+        # ensure run mapping directory exists and record subset-index → run_dir
+        runs_dir = os.path.join(config["cache_path"], "runs")
+        os.makedirs(runs_dir, exist_ok=True)
+        mapping_file = os.path.join(runs_dir, "run_mapping.json")
+        if os.path.exists(mapping_file):
+            with open(mapping_file, "r") as mf:
+                mapping = json.load(mf)
+        else:
+            mapping = {}
+        # determine and register this run's folder for subset
+        run_dir = os.path.join(runs_dir, str(train_subset_index))
+        os.makedirs(run_dir, exist_ok=True)
+        mapping[str(train_subset_index)] = run_dir
+        checkpoint_path = run_dir
+        with open(mapping_file, "w") as mf:
+            json.dump(mapping, mf, indent=2)
+
+   
+
+    # Build the model
     model = build_model(config)
-    # model = torch.compile(model, backend="inductor")
-    # Compile with TorchDynamo + Inductor in dynamic‐shape mode:
-    # - dynamic=True tells Inductor to emit a single polymorphic kernel
-    #   that can handle varying sequence lengths without recompiling each
-    #   time a new input shape is seen.
-    # - This avoids unbounded graph‐caching and GPU memory growth
-    #   when training with multi‐GPU and variable padding.
-    # model = torch.compile(model, backend="inductor", dynamic=True)
-    # Compile with TorchDynamo + Inductor for maximum training throughput.
-    # We use a static (fullgraph) compile since all batch‐shapes are now fixed.
-    # model = torch.compile(
-    #     model,
-    #     backend="inductor",
-    #     fullgraph=True,
-    #     dynamic=False,
-    # )
 
     optimizer = AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
    
@@ -271,14 +276,33 @@ def main():
         num_training_steps=config["num_epochs"] * len(train_loader),
     )
 
-    if checkpoint_path and os.path.exists(checkpoint_path):
+    # check if checkpoint path contains a file ending .bin
+
+
+    # check if checkpoint path contains a file ending .bin
+    bin_files = glob.glob(os.path.join(checkpoint_path, "*.bin"))
+    if checkpoint_path and os.path.exists(checkpoint_path) and bin_files:
         print(f"Loading checkpoint from {checkpoint_path}")
         accelerator.load_state(checkpoint_path)
     else:
         print(f"No checkpoint found at {checkpoint_path}, starting from scratch.")  
     start_epoch = 0
 
-    train_loop(accelerator, model, tokenizer, train_loader, val_loader, optimizer, scheduler, config, checkpoint_path, start_epoch, total_tokens_train)
+    train_loop(
+        accelerator,
+        model,
+        tokenizer,
+        train_loader,
+        val_loader,
+        optimizer,
+        scheduler,
+        config,
+        checkpoint_path,
+        start_epoch,
+        total_tokens_train,
+        train_subset_index,
+        args.tqdm_offset,
+    )
 
 
 if __name__ == "__main__":

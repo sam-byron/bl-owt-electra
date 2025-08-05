@@ -1,4 +1,3 @@
-import gc
 import os
 import random
 import torch
@@ -9,11 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datasets import concatenate_datasets
 
 def save_checkpoint(epoch, model, optimizer, scheduler, scaler, checkpoint_path="checkpoint.pt"):
-     # if model is wrapped (DDP, DistributedDataParallel, etc.) it has .module
-    model_to_save = model.module if hasattr(model, "module") else model
     torch.save({
         "epoch": epoch,
-        "model_state_dict": model_to_save.state_dict(),
+        "model_state_dict": model.module.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
@@ -93,29 +90,17 @@ def load_chunk(chunk_path):
     print(f"Loading chunk from {chunk_path}...", flush=True)
     return torch.load(chunk_path, map_location="cpu")
 
-def load_chunk_safe(path):
-    try:
-        return load_chunk(path)
-    except (RuntimeError, EOFError) as e:
-        print(f"[Warning] failed to load {path}: {e}")
-        return []
-
-from concurrent.futures import ThreadPoolExecutor
-
-# global thread pool for parallel disk writes
-_SAVE_POOL = ThreadPoolExecutor(max_workers=64)
-
 def process_and_save_chunk(arg, tokenizer):
     """
     Tokenize and save a single chunk.
     Now each chunk filename includes the target_rank so that different GPUs won't overwrite each other.
     """
+    # num_workers = min(64, len(args))
     cache_path = []  # Initialize chunk_paths
     # tokenized_chunks = []
     
     sample_chunk, chunk_index, cache_path, tokenize_with_tokenizer = arg
-    # sample_chunk = [sample["text"] + tokenizer.eos_token for sample in sample_chunk]
-    sample_chunk = [sample["text"] for sample in sample_chunk]
+    sample_chunk = [sample["text"] + tokenizer.eos_token for sample in sample_chunk]
     if not isinstance(sample_chunk, list) or not all(isinstance(t, str) for t in sample_chunk):
         print(f"Expected list[str], got {type(sample_chunk)}")
         raise ValueError(f"Expected list[str], got {type(sample_chunk)}")
@@ -127,15 +112,10 @@ def process_and_save_chunk(arg, tokenizer):
         print(f"Error tokenizing chunk {chunk_index}: {e}", flush=True)
         return None
     cache_path = os.path.join(cache_path, f"chunk{chunk_index}.pt")
-    # print(f"Saving chunk {chunk_index}", flush=True)
-    # torch.save(tokenized_chunk, cache_path)
-    fut = _SAVE_POOL.submit(torch.save, tokenized_chunk, cache_path)
-    fut.add_done_callback(lambda f: print(f"Saved chunk {chunk_index} → {cache_path}", flush=True))
-    # print(f"Saved chunk {chunk_index}", flush=True)
+    print(f"Saving chunk {chunk_index}", flush=True)
+    torch.save(tokenized_chunk, cache_path)
+    print(f"Saved chunk {chunk_index}", flush=True)
     print(f"Tokenization complete for {len(tokenized_chunk)} chunks", flush=True)
-    # Delete the sample_chunk to free memory
-    del sample_chunk
-    gc.collect()  # Force garbage collection to free memory
 
-    return fut
+    return
 

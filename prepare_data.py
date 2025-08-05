@@ -52,7 +52,19 @@ def prepare_data(config, tokenizer, cache_path):
 
     tokenize_with_tokenizer = partial(tokenize_sample, tokenizer=tokenizer)
 
-    ds = load_dataset("vesteinn/babylm", split="train", streaming=False)
+    # build paths to your local dataset script and subset files
+    script_path = os.path.join(os.path.dirname(__file__), "openwebtext.py")
+    subset_files = glob.glob(os.path.join(cache_path, "subsets", "*"))
+
+    ds = load_dataset(
+        "/home/sam-byron/.cache/huggingface/hub/datasets--Skylion007--openwebtext/snapshots/f3808c30e817981b845ec549c43e82bb467d8144/openwebtext.py",
+        data_files={"train": subset_files},
+        cache_dir=cache_path,
+        trust_remote_code=True,
+        streaming=False,
+        split="train",
+        num_proc=120,  # Use multiple processes for tokenization
+    )
 
     # wrap the HuggingFace streaming IterableDataset in a PyTorch DataLoader
     # to parallelize I/O with num_workers > 1
@@ -62,13 +74,14 @@ def prepare_data(config, tokenizer, cache_path):
         batch_size=chunk_size,
         num_workers=min(6, mp.cpu_count()),
         collate_fn=identity_collate_fn,  # identity: list of raw examples
+        # shuffle=True,  # shuffle the dataset to ensure randomness
     )
     
     # chunk_idx = len(chunk_paths)
     chunk_idx = 0
     # chunks = chunked(stream, chunk_size)
     
-    pool = Pool(processes=min(mp.cpu_count(), 96))
+    pool = Pool(processes=min(mp.cpu_count(), 100))
     # now iterate batches of size chunk_size in parallel
     for chunk_idx, chunk in enumerate(dataloader):
         print(f"Appending chunk {chunk_idx}, with {len(chunk)} examples")
@@ -168,12 +181,12 @@ def main():
     if args.sanitize:
         # Sanitize the chunks in the cache directory
         print(f"Sanitizing chunks...")
-        valid_count, corrupted_count = sanitize_chunks_fast(config, 32)
+        valid_count, corrupted_count = sanitize_chunks_fast(config, 100)
         print(f"Valid chunks: {valid_count}, Corrupted chunks removed: {corrupted_count}")
-        tokenizer.save_pretrained(config["cache_path"])  # Save tokenizer to cache path
+        # tokenizer.save_pretrained(config["cache_path"])  # Save tokenizer to cache path
         return
     
-    tokenizer.save_pretrained(config["cache_path"])  # Save tokenizer to cache path
+    # tokenizer.save_pretrained(config["cache_path"])  # Save tokenizer to cache path
     # tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     # tokenizer.pad_token = tokenizer.eos_token
     prepare_data(
