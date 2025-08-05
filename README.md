@@ -7,6 +7,8 @@ python3 data_loader.py --config_path model_babylm_bert.json
 
 python3 transformer_trainer.py --config_path model_babylm_bert.json
 
+python3 transformer_trainer.py --config_path model_babylm_bert_large.json --checkpoint_path model_babylm_bert/runs/28/
+
 lm_eval --model hf-mlm --model_args pretrained=/home/sam-byron/engineering/ML/playground/babylm/bert/model_babylm_bert/checkpoint.pt,backend="mlm" --tasks blimp --device cuda:1 --batch_size 64
 
 

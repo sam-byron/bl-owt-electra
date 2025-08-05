@@ -57,13 +57,15 @@ def prepare_data(config, tokenizer, cache_path):
     subset_files = glob.glob(os.path.join(cache_path, "subsets", "*"))
 
     ds = load_dataset(
-        "/home/sam-byron/.cache/huggingface/hub/datasets--Skylion007--openwebtext/snapshots/f3808c30e817981b845ec549c43e82bb467d8144/openwebtext.py",
-        data_files={"train": subset_files},
+        # script=script_path,              
+        # name="Skylion007/openwebtext",                     # ← use your local dataset script
+        # data_files={"train": subset_files},            # ← point at your already-downloaded subsets
         cache_dir=cache_path,
         trust_remote_code=True,
         streaming=False,
         split="train",
-        num_proc=120,  # Use multiple processes for tokenization
+        num_proc=max(1, mp.cpu_count() - 4),
+        path=script_path
     )
 
     # wrap the HuggingFace streaming IterableDataset in a PyTorch DataLoader

@@ -18,7 +18,7 @@ from collator import Collator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from datasets import concatenate_datasets
-from transformers import AutoTokenizer, get_scheduler
+from transformers import AutoTokenizer, get_scheduler, DataCollatorForWholeWordMask
 import argparse
 import json
 from typing import Union
@@ -228,34 +228,38 @@ class TokenBudgetBatchSampler(BatchSampler):
         return len(self.batches)
 
 
-def data_loader(config, tokenizer, cache_path):
+def data_loader(config, tokenizer, cache_path, train_subset_index=None):
     block_size = config["block_size"]
     batch_size = config["batch_size"]
 
     # Load or create cached splits
     subset_train_paths, val_paths, test_paths = create_and_cache_splits(config)
+    if train_subset_index is None:
+        # — skip any subsets we've already trained on (per run_mapping.json) —
+        runs_base    = Path(cache_path) / "runs"
+        mapping_file = runs_base / "run_mapping.json"
+        if mapping_file.exists():
+            with open(mapping_file, "r") as mf:
+                completed_map = json.load(mf)
+            completed_indices = {int(k) for k in completed_map.keys()}
+        else:
+            completed_indices = set()
 
-    # — skip any subsets we've already trained on (per run_mapping.json) —
-    runs_base    = Path(cache_path) / "runs"
-    mapping_file = runs_base / "run_mapping.json"
-    if mapping_file.exists():
-        with open(mapping_file, "r") as mf:
-            completed_map = json.load(mf)
-        completed_indices = {int(k) for k in completed_map.keys()}
+        # find indices not yet processed
+        all_indices     = list(range(len(subset_train_paths)))
+        available       = [i for i in all_indices if i not in completed_indices]
+        if not available:
+            print("All train subsets have been processed. Exiting.")
+            sys.exit(100)
+
+        # pick one remaining subset at random
+        train_subset_index = random.choice(available)
     else:
-        completed_indices = set()
-
-    # find indices not yet processed
-    all_indices     = list(range(len(subset_train_paths)))
-    available       = [i for i in all_indices if i not in completed_indices]
-    if not available:
-        print("All train subsets have been processed. Exiting.")
-        sys.exit(100)
-
-    # pick one remaining subset at random
-    train_subset_index = random.choice(available)
+        train_subset_index = int(train_subset_index)
     train_paths        = subset_train_paths[train_subset_index]
-    print(f"Using train subset {train_subset_index + 1}/{len(subset_train_paths)}: {len(train_paths)} files")
+    # shuffle the train paths
+    random.shuffle(train_paths)
+    print(f"Using train subset {train_subset_index}/{len(subset_train_paths)}: {len(train_paths)} files")
 
     pad_id = tokenizer.pad_token_id
     print("Creating ChunkedDataset instances (with padding)...")
@@ -275,7 +279,13 @@ def data_loader(config, tokenizer, cache_path):
     print(f"Test dataset length: {len(test_ds)}")
 
     # build the base MLM collator
-    base_collator = DataCollatorForLanguageModeling(
+    # base_collator = DataCollatorForLanguageModeling(
+    #     tokenizer=tokenizer,
+    #     mlm=True,
+    #     mlm_probability=0.15,
+    # )
+    # Supposedly whole word masking is better for BERT‐like models
+    base_collator = DataCollatorForWholeWordMask(
         tokenizer=tokenizer,
         mlm=True,
         mlm_probability=0.15,
@@ -303,10 +313,10 @@ def data_loader(config, tokenizer, cache_path):
     train_loader = DataLoader(
         train_ds,
         batch_sampler=train_batch_sampler,
-        num_workers=8,
+        num_workers=12,
         pin_memory=True,
         collate_fn=collate_fn_with_mask,
-        prefetch_factor=4,
+        prefetch_factor=6,
     )
 
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,

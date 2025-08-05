@@ -204,7 +204,7 @@ def main():
     master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
     master_port = os.environ.get("MASTER_PORT", "29500")
 
-    accelerator = Accelerator()
+    accelerator = Accelerator(mixed_precision="fp16")
     accelerator.even_batches = False  # Disable "even batches" enforcement since we use a batch_sampler without fixed batch_size
 
     parser = argparse.ArgumentParser(description="Chatbot Training Script with Accelerate")
@@ -213,8 +213,13 @@ def main():
         help="Path to the configuration file"
     )
     parser.add_argument(
-        "--checkpoint_path", type=str, default=None,
+        "--checkpoint_path", type=str, default="",
         help="Directory to save to or load from"
+    )
+
+    parser.add_argument(
+        "--train_idx", type=str, default=None,
+        help="Index of the training subset to use"
     )
 
     parser.add_argument(
@@ -232,15 +237,17 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
     # tokenizer.pad_token = tokenizer.eos_token
 
-    # get loaders and which subset‐index we're on
-    train_loader, val_loader, test_loader, collate_fn, total_tokens_train, train_subset_index = \
-        data_loader(config, tokenizer, config["cache_path"])
-    if args.checkpoint_path:
-        if not os.path.isdir(args.checkpoint_path):
-            raise ValueError(f"Invalid --checkpoint_path for resume: {args.checkpoint_path}")
-        checkpoint_path = args.checkpoint_path
-        print(f"Resuming from checkpoint: {checkpoint_path}")
-    else:
+        
+    if args.checkpoint_path is not None:
+        if not args.train_idx:
+            
+            train_subset_index = int(args.train_idx)
+            train_loader, val_loader, test_loader, collate_fn, total_tokens_train, train_subset_index = \
+                data_loader(config, tokenizer, config["cache_path"], train_subset_index)
+        else:
+            train_subset_index = None
+            train_loader, val_loader, test_loader, collate_fn, total_tokens_train, train_subset_index = \
+                data_loader(config, tokenizer, config["cache_path"])
         # ensure run mapping directory exists and record subset-index → run_dir
         runs_dir = os.path.join(config["cache_path"], "runs")
         os.makedirs(runs_dir, exist_ok=True)
@@ -257,7 +264,11 @@ def main():
         checkpoint_path = run_dir
         with open(mapping_file, "w") as mf:
             json.dump(mapping, mf, indent=2)
-
+    else:
+        if not os.path.isdir(args.checkpoint_path):
+            raise ValueError(f"Invalid --checkpoint_path for resume: {args.checkpoint_path}")
+        checkpoint_path = args.checkpoint_path
+        print(f"Resuming from checkpoint: {checkpoint_path}")
    
 
     # Build the model
@@ -268,6 +279,21 @@ def main():
     model, optimizer, train_loader, test_loader, val_loader, batch_sampler = accelerator.prepare(
         model, optimizer, train_loader, test_loader, val_loader, train_loader.batch_sampler
     )
+
+     # —––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+    # Print model architecture, parameter counts, and full size
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    total_mb = total_bytes / (1024 ** 2)
+    print("===== Model Summary =====", flush=True)
+    print(model, flush=True)
+    print(f"Total parameters:     {total_params:,}", flush=True)
+    print(f"Trainable parameters: {trainable_params:,}", flush=True)
+    print(f"Approx. model size:   {total_mb:.2f} MB", flush=True)
+    print("==========================", flush=True)
+    # —––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+    
     # model = torch.compile(model, backend="inductor")
     scheduler = get_scheduler(
         "cosine",
