@@ -69,7 +69,7 @@ def tokenize_sample(sample, tokenizer):
 
     if not isinstance(sample, list) or not all(isinstance(x, str) for x in sample):
         raise ValueError(f"Expected list[str], got {type(sample)}")
-    return tokenizer(sample, add_special_tokens=False, truncation=True)["input_ids"]  # Tokenize the sample and return the input IDs
+    return tokenizer(sample, add_special_tokens=False, truncation=True, return_tensors="pt", padding=True)  # Tokenize the sample and return the input IDs
 
 def tokenize_samples(samples, tokenizer):
     """Tokenize a batch of samples."""
@@ -120,7 +120,8 @@ def process_and_save_chunk(arg, tokenizer):
         print(f"Expected list[str], got {type(sample_chunk)}")
         raise ValueError(f"Expected list[str], got {type(sample_chunk)}")
     try:
-        tokenized_chunk = tokenize_with_tokenizer(sample_chunk)  # Ensure the tokenizer is called to avoid lazy evaluation issues
+        tokenized_chunk = tokenize_with_tokenizer(sample_chunk, padding=True, truncation=True, max_length=tokenizer.model_max_length) 
+        tokenized_chunk = tokenized_chunk["input_ids"] # Ensure the tokenizer is called to avoid lazy evaluation issues
         if not tokenized_chunk:
             raise ValueError("Tokenizer did not produce any output. Check the input or tokenizer implementation.")
     except Exception as e:
@@ -132,9 +133,10 @@ def process_and_save_chunk(arg, tokenizer):
     fut = _SAVE_POOL.submit(torch.save, tokenized_chunk, cache_path)
     fut.add_done_callback(lambda f: print(f"Saved chunk {chunk_index} → {cache_path}", flush=True))
     # print(f"Saved chunk {chunk_index}", flush=True)
+    # print(f"tokenized_chunk: {tokenized_chunk}", flush=True)
     print(f"Tokenization complete for {len(tokenized_chunk)} chunks", flush=True)
     # Delete the sample_chunk to free memory
-    del sample_chunk
+    del tokenized_chunk
     gc.collect()  # Force garbage collection to free memory
 
     return fut

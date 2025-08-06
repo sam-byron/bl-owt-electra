@@ -18,6 +18,16 @@ import torch.distributed as dist
 import traceback
 from datetime import timedelta
 # import torch.distributed as dist
+from transformers import (
+    ElectraConfig,
+    ElectraForPreTraining,
+    ElectraTokenizerFast,
+    DataCollatorForLanguageModeling,
+    Trainer,
+    TrainingArguments,
+    ElectraForMaskedLM,
+)
+
 
 class EmptyDataset(Dataset):
     def __len__(self): 
@@ -25,19 +35,31 @@ class EmptyDataset(Dataset):
     def __getitem__(self, idx): 
         raise IndexError
 
-# @torch.compile
-def build_model(config):
-    model_config = BertConfig(
-        vocab_size=config["vocab_size"],
-        max_position_embeddings=config["n_positions"],
-        hidden_size=config["n_embed"],
-        num_hidden_layers=config["n_layer"],
-        num_attention_heads=config["n_head"],
-        intermediate_size=config["n_embed"] * 4,
+# 4. Build an ELECTRA config
+    #    - embedding_size: size of the generator’s embeddings
+    #    - hidden_size etc. define the discriminator
+def build_model(config, tokenizer):
+    gen_config = ElectraConfig(
+        vocab_size=tokenizer.vocab_size,
+        embedding_size=config["embedding_size"],        # smaller generator
+        hidden_size=config["hidden_size"],           # discriminator hidden size
+        num_hidden_layers=config["num_hidden_layers"],      # discriminator depth
+        num_attention_heads=config["num_attention_heads"],  # number of attention heads
+        intermediate_size=config["intermediate_size"],  # size of the feedforward layer
+        max_position_embeddings=config["max_position_embeddings"],
+        generator_hidden_size=config["generator_hidden_size"], # generator depth = hidden_size / 3
+        generator_num_hidden_layers=config["generator_num_hidden_layers"],
+        layer_norm_eps=config["layer_norm_eps"],
+        hidden_dropout_prob=config["hidden_dropout_prob"],
+        attention_probs_dropout_prob=config["attention_probs_dropout_prob"],
     )
-    model = BertForMaskedLM(model_config)
+    disc_config = ElectraConfig.from_pretrained("google/electra-base-discriminator")
 
-    return model
+    # 5. Instantiate ELECTRA for pretraining
+    generator     = ElectraForMaskedLM(gen_config)
+    discriminator = ElectraForPreTraining(disc_config)
+
+    return generator, discriminator
 
 import time
 import datetime
@@ -55,7 +77,8 @@ def train_loop(
     start_epoch,
     total_tokens_train,
     train_subset_index,
-    tqdm_offset=0
+    disc,
+    tqdm_offset=0,
 ):
     num_epochs = config["num_epochs"]
     if start_epoch >= num_epochs:
@@ -70,6 +93,7 @@ def train_loop(
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
+        disc.train()
         total_loss = 0.0
         processed_tokens = 0
         epoch_start = time.time()
@@ -100,17 +124,48 @@ def train_loop(
             for step, batch in enumerate(train_loader):
                 # --- ensure every GPU sees the same sequence‐length before any collectives ---
                 # pad each tensor in batch to the global max length across processes
-                for key in ("input_ids", "attention_mask", "labels"):
-                    batch[key] = accelerator.pad_across_processes(batch[key], dim=1)
+                # for key in ("input_ids", "attention_mask"):
+                #     batch[key] = accelerator.pad_across_processes(batch[key], dim=1)
 
                 with accelerator.accumulate(model):
                     with accelerator.autocast():
+                        mlm_labels = batch["labels"]
                         outputs = model(
                             input_ids=batch["input_ids"],
                             attention_mask=batch["attention_mask"],
-                            labels=batch["labels"],
+                            # For ElectraForPreTraining, the 'labels' argument should contain the original
+                            # input_ids. The model uses these as the ground truth for the generator's MLM task.
+                            # It handles the creation of the discriminator's binary labels internally.
+                            labels=mlm_labels,
                         )
-                        loss = outputs.loss
+                        gen_loss = outputs.loss
+                        gen_logits = outputs.logits
+
+                        # Build corrupted inputs for discriminator
+                        with torch.no_grad():
+                            preds = torch.argmax(gen_logits, dim=-1)
+                            corrupted = batch["input_ids"].clone()
+                            mask_pos = mlm_labels != -100
+                            corrupted[mask_pos] = preds[mask_pos]
+
+                        # Discriminator forward + loss (RTD)
+                        # labels: 1 if original, 0 if replaced → mask_pos==True
+                        disc_labels = (~mask_pos).long()
+                        disc_out = disc(
+                            input_ids=corrupted,
+                            attention_mask=batch["attention_mask"],
+                            labels=disc_labels,
+                        )
+                        disc_loss = disc_out.loss
+                         # Combined loss (you can scale generator loss if desired)
+                        loss = disc_loss + gen_loss
+
+                        # --- DEBUG: Print loss components ---
+                        # if is_main and (loss.isnan() or loss.isinf() or loss < 0):
+                        #     print(f"Problematic Loss Detected: {loss.item()}")
+                        #     print(f"  - Generator Loss: {outputs.generator_loss.item()}")
+                        #     print(f"  - Discriminator Loss: {outputs.discriminator_loss.item()}")
+                        # --- END DEBUG ---
 
                         accelerator.backward(loss)
                          # Clip gradients to prevent them from exploding, a common cause of NaNs.
@@ -205,6 +260,7 @@ def main():
     master_port = os.environ.get("MASTER_PORT", "29500")
 
     accelerator = Accelerator(mixed_precision="fp16")
+    # accelerator = Accelerator()
     accelerator.even_batches = False  # Disable "even batches" enforcement since we use a batch_sampler without fixed batch_size
 
     parser = argparse.ArgumentParser(description="Chatbot Training Script with Accelerate")
@@ -234,12 +290,13 @@ def main():
     checkpoint_path = os.path.join(config["cache_path"], "checkpoint.pt")
     # decide checkpoint dir: resume existing or create new
     
-    tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
-    # tokenizer.pad_token = tokenizer.eos_token
+    # 2. Initialize an ELECTRA tokenizer (you can train your own vocab too)
+    tokenizer = ElectraTokenizerFast.from_pretrained("google/electra-small-discriminator")
+    tokenizer.model_max_length = 512
 
         
     if args.checkpoint_path is not None:
-        if not args.train_idx:
+        if args.train_idx:
             
             train_subset_index = int(args.train_idx)
             train_loader, val_loader, test_loader, collate_fn, total_tokens_train, train_subset_index = \
@@ -272,12 +329,12 @@ def main():
    
 
     # Build the model
-    model = build_model(config)
+    model, disc = build_model(config, tokenizer)
 
     optimizer = AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
    
-    model, optimizer, train_loader, test_loader, val_loader, batch_sampler = accelerator.prepare(
-        model, optimizer, train_loader, test_loader, val_loader, train_loader.batch_sampler
+    model, optimizer, train_loader, test_loader, val_loader, batch_sampler, disc = accelerator.prepare(
+        model, optimizer, train_loader, test_loader, val_loader, train_loader.batch_sampler, disc
     )
 
      # —––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
@@ -327,6 +384,7 @@ def main():
         start_epoch,
         total_tokens_train,
         train_subset_index,
+        disc,
         args.tqdm_offset,
     )
 

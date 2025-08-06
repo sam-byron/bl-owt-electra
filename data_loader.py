@@ -25,6 +25,14 @@ from typing import Union
 from typing import List, Iterator
 from transformers import DataCollatorForLanguageModeling
 import sys
+from transformers import (
+    ElectraConfig,
+    ElectraForPreTraining,
+    ElectraTokenizerFast,
+    DataCollatorForLanguageModeling,
+    Trainer,
+    TrainingArguments,
+)
 
 # helper to compute total real tokens in a Dataset
 def compute_total_tokens(ds: Union[Dataset, object]) -> int:
@@ -279,13 +287,7 @@ def data_loader(config, tokenizer, cache_path, train_subset_index=None):
     print(f"Test dataset length: {len(test_ds)}")
 
     # build the base MLM collator
-    # base_collator = DataCollatorForLanguageModeling(
-    #     tokenizer=tokenizer,
-    #     mlm=True,
-    #     mlm_probability=0.15,
-    # )
-    # Supposedly whole word masking is better for BERT‐like models
-    base_collator = DataCollatorForWholeWordMask(
+    base_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=True,
         mlm_probability=0.15,

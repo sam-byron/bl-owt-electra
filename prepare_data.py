@@ -18,9 +18,21 @@ from itertools import islice
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 from transformers import BertTokenizer, BertModel
+from transformers import (
+    ElectraConfig,
+    ElectraForPreTraining,
+    ElectraTokenizerFast,
+    DataCollatorForLanguageModeling,
+    Trainer,
+    TrainingArguments,
+)
+from transformers.tokenization_utils_base import BatchEncoding
 
 # limit PyTorch to 1 thread per process as well
 # torch.set_num_threads(1)
+
+# Add safe globals for torch serialization
+torch.serialization.add_safe_globals([BatchEncoding])
 
 # Define the collate function at the top level to make it picklable by multiprocessing workers
 def identity_collate_fn(examples):
@@ -50,7 +62,7 @@ def prepare_data(config, tokenizer, cache_path):
 
     chunk_size = config["chunk_size"]
 
-    tokenize_with_tokenizer = partial(tokenize_sample, tokenizer=tokenizer)
+    tokenize_with_tokenizer = tokenizer=tokenizer
 
     # build paths to your local dataset script and subset files
     script_path = os.path.join(os.path.dirname(__file__), "openwebtext.py")
@@ -62,9 +74,9 @@ def prepare_data(config, tokenizer, cache_path):
         # data_files={"train": subset_files},            # ← point at your already-downloaded subsets
         cache_dir=cache_path,
         trust_remote_code=True,
-        streaming=False,
+        streaming=True,
         split="train",
-        num_proc=max(1, mp.cpu_count() - 4),
+        # num_proc=max(1, mp.cpu_count() - 4),
         path=script_path
     )
 
@@ -83,7 +95,7 @@ def prepare_data(config, tokenizer, cache_path):
     chunk_idx = 0
     # chunks = chunked(stream, chunk_size)
     
-    pool = Pool(processes=min(mp.cpu_count(), 100))
+    pool = Pool(processes=min(mp.cpu_count(), 64))
     # now iterate batches of size chunk_size in parallel
     for chunk_idx, chunk in enumerate(dataloader):
         print(f"Appending chunk {chunk_idx}, with {len(chunk)} examples")
@@ -105,7 +117,7 @@ def prepare_data(config, tokenizer, cache_path):
 def check_chunk_file(path):
     """Check if a single chunk file is valid. Returns (path, is_valid, error_msg)"""
     try:
-        torch.load(path, map_location="cpu")
+        torch.load(path, map_location="cpu")  # still weights_only=True
         return (path, True, None)
     except Exception as e:  # Catch all exceptions instead of specific ones
         return (path, False, str(e))
@@ -179,7 +191,8 @@ def main():
     args = parser.parse_args()
     with open(args.config_path, "r") as config_file:
         config = json.load(config_file)
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    tokenizer = ElectraTokenizerFast.from_pretrained("google/electra-small-discriminator")
+    tokenizer.model_max_length = 512
     if args.sanitize:
         # Sanitize the chunks in the cache directory
         print(f"Sanitizing chunks...")

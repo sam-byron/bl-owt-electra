@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG="${1:-model_babylm_bert.json}"
+CONFIG="${1:-model_babylm_electra.json}"
 SESSION="train_gpu"
 GPUS=$(nvidia-smi --query-gpu=index --format=csv,noheader)
 

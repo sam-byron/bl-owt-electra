@@ -1,11 +1,11 @@
 # finance_chatbot
 
-python3 prepare_data.py --config_path model_babylm_bert.json
-python3 prepare_data.py --config_path model_babylm_bert.json --sanitize
+python3 prepare_data.py --config_path model_babylm_electra.json
+python3 prepare_data.py --config_path model_babylm_electra.json --sanitize
 
-python3 data_loader.py --config_path model_babylm_bert.json
+python3 data_loader.py --config_path model_babylm_electra.json
 
-python3 transformer_trainer.py --config_path model_babylm_bert.json
+python3 transformer_trainer.py --config_path model_babylm_electra.json
 
 python3 transformer_trainer.py --config_path model_babylm_bert_large.json --checkpoint_path model_babylm_bert/runs/28/
 
