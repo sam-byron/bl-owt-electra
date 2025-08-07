@@ -64,21 +64,33 @@ def prepare_data(config, tokenizer, cache_path):
 
     tokenize_with_tokenizer = tokenizer=tokenizer
 
-    # build paths to your local dataset script and subset files
-    script_path = os.path.join(os.path.dirname(__file__), "openwebtext.py")
-    subset_files = glob.glob(os.path.join(cache_path, "subsets", "*"))
+    # 1) Point to all TXT files
+    data_files = {"train": glob.glob("/home/sam-byron/engineering/ML/playground/babylm/bnc/bl-owt-electra/parsed_bnc/*.txt")}
+    # data_files = {"train": glob.glob("/home/sam-byron/engineering/ML/playground/babylm/bnc/bl-owt-electra/bnc/*.xml")}
 
+    # 2) Load as text, sampling by paragraph
     ds = load_dataset(
-        # script=script_path,              
-        # name="Skylion007/openwebtext",                     # ← use your local dataset script
-        # data_files={"train": subset_files},            # ← point at your already-downloaded subsets
-        cache_dir=cache_path,
-        trust_remote_code=True,
-        streaming=True,
+        "text",
+        data_files=data_files,
+        # sample_by="paragraph",
+        # keep_linebreaks=False,  # each line is already one sentence
+        streaming=False,
         split="train",
-        # num_proc=max(1, mp.cpu_count() - 4),
-        path=script_path
+        num_proc=6  # Enable multiprocessing for loading dataset
     )
+
+    # Print first 5 samples to verify loading
+    print("First 5 samples from the dataset:")
+    for i, sample in enumerate(ds.select(range(5))):
+        print(f"Sample {i}: {sample['text']}...")
+
+    # Print number of samples in the dataset
+    print(f"Number of samples in dataset: {len(ds)}")
+
+    # Print number of words in the dataset
+    total_words = sum(len(sample["text"].split()) for sample in ds)
+    print(f"Total words in dataset: {total_words}")
+    # return
 
     # wrap the HuggingFace streaming IterableDataset in a PyTorch DataLoader
     # to parallelize I/O with num_workers > 1
@@ -86,7 +98,7 @@ def prepare_data(config, tokenizer, cache_path):
     dataloader = DataLoader(
         ds,
         batch_size=chunk_size,
-        num_workers=min(6, mp.cpu_count()),
+        num_workers=min(10, mp.cpu_count()),
         collate_fn=identity_collate_fn,  # identity: list of raw examples
         # shuffle=True,  # shuffle the dataset to ensure randomness
     )

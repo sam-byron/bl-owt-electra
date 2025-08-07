@@ -1,5 +1,6 @@
 from datetime import datetime
 from collections import OrderedDict
+import gc
 import math
 # from torch.utils.data import Dataset
 import os
@@ -44,7 +45,7 @@ def compute_total_tokens(ds: Union[Dataset, object]) -> int:
     if hasattr(ds, "index_map"):
         return sum(end - start for (_, _, start, end) in ds.index_map)
     # fallback for map‐style datasets returning dicts
-    return sum(len(ex["input_ids"]) for ex in ds)
+    return sum(len(ex) for ex in ds)
 
 # helper to build index entries for one chunk file in parallel
 def _index_for_path(args):
@@ -81,13 +82,14 @@ class ChunkedDataset(Dataset):
 
     def _build_index(self):
         """Create self.index_map = [ (path, seq_idx, start, end), ... ]"""
-        # build flat index in parallel by chunk file
+        # build flat index in parallel by chunk file using multiprocessing.Pool
         args = [(path, self.block_size) for path in self.chunk_paths]
         max_workers = min(mp.cpu_count(), len(args))
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            lists_of_entries = executor.map(_index_for_path, args)
-        # flatten into a single index_map
-        self.index_map = list(chain.from_iterable(lists_of_entries))
+        self.index_map = []
+        with mp.Pool(processes=max_workers) as pool:
+            # imap_unordered streams back partial results as soon as they're done
+            for entries in pool.imap_unordered(_index_for_path, args, chunksize=10):
+                self.index_map.extend(entries)
         # Precompute the true length of each block (before padding)
         self.block_lengths = [end - start for (_, _, start, end) in self.index_map]
 
@@ -106,73 +108,65 @@ class ChunkedDataset(Dataset):
         seq = self._chunk_cache[path][seq_i]
         sub = seq[start:end] if isinstance(seq, torch.Tensor) else seq[start:end]
         lst = sub.tolist() if isinstance(sub, torch.Tensor) else sub
-        # if len(lst) < self.block_size:
-        #     lst = lst + [self.pad_token_id] * (self.block_size - len(lst))
+        if len(lst) < self.block_size:
+            lst = lst + [self.pad_token_id] * (self.block_size - len(lst))
         return torch.tensor(lst, dtype=self.dtype)
 
 
 def create_and_cache_splits(config):
-    """Create multiple small train‐subsets plus one val/test, cache to disk."""
-    cache_path   = config["cache_path"]
-    splits_dir   = Path(cache_path) / "splits"
-    splits_dir.mkdir(exist_ok=True, parents=True)
-    splits_file  = splits_dir / "dataset_splits.json"
-
-    # If already cached, just load and return
+    """Create train/val/test splits once and cache them."""
+    
+    cache_path = config["cache_path"]
+    # Create splits directory
+    splits_dir = Path(cache_path) / "splits"
+    splits_dir.mkdir(exist_ok=True)
+    
+    # Check if splits already exist
+    splits_file = splits_dir / "dataset_splits.json"
     if splits_file.exists():
         print("Dataset splits already exist, loading cached splits...")
-        with open(splits_file, "r") as f:
+        with open(splits_file, 'r') as f:
             splits = json.load(f)
-        return splits["train_subsets"], splits["val_paths"], splits["test_paths"]
-
-    print("Creating new dataset splits…")
-    chunk_paths       = sorted(glob.glob(os.path.join(cache_path, "chunk*.pt")))
+        return splits['train_paths'], splits['val_paths'], splits['test_paths']
+    
+    # Create new splits
+    print("Creating new dataset splits...")
+    chunk_paths = sorted(glob.glob(os.path.join(cache_path, "chunk*.pt")))
+    
+    # Shuffle once and save the order
     random.shuffle(chunk_paths)
+    
+    train_frac = config.get("train_frac", 0.85)
+    val_frac   = config.get("val_frac", 0.05)
+    
+    N = len(chunk_paths)
+    idx1 = int(train_frac * N)
+    idx2 = int((train_frac + val_frac) * N)
 
-    N                 = len(chunk_paths)
-    train_frac        = config.get("train_frac", 0.9)
-    val_frac          = config.get("val_frac",   0.05)
-    subset_frac       = config.get("train_subset_frac", 0.035)
-
-    # how many chunks total for train/val/test
-    n_train_total     = int(train_frac * N)
-    n_val             = int(val_frac   * N)
-    # remainder is test
-    n_test            = N - n_train_total - n_val
-
-    train_all         = chunk_paths[:n_train_total]
-    val_paths         = chunk_paths[n_train_total:n_train_total + n_val]
-    test_paths        = chunk_paths[n_train_total + n_val:]
-
-    # split train_all into small subsets of size subset_frac * N
-    subset_size       = max(1, int(subset_frac * n_train_total))
-    train_subsets     = [
-        train_all[i: i + subset_size]
-        for i in range(0, len(train_all), subset_size)
-    ]
-
-    # cache
-    out = {
-        "train_subsets": train_subsets,
-        "val_paths":     val_paths,
-        "test_paths":    test_paths,
-        "created_at":    str(datetime.now()),
-        "config": {
-            "train_frac":        train_frac,
-            "val_frac":          val_frac,
-            "train_subset_frac": subset_frac,
-            "total_chunks":      N,
-            "n_train_subsets":   len(train_subsets),
-            "subset_size":       subset_size,
-        },
+    train_paths = chunk_paths[:idx1]
+    val_paths   = chunk_paths[idx1:idx2]
+    test_paths  = chunk_paths[idx2:]
+    
+    # Cache the splits
+    splits = {
+        'train_paths': train_paths,
+        'val_paths': val_paths,
+        'test_paths': test_paths,
+        'created_at': str(datetime.now()),
+        'config': {
+            'train_frac': train_frac,
+            'val_frac': val_frac,
+            'total_chunks': N
+        }
     }
-    with open(splits_file, "w") as f:
-        json.dump(out, f, indent=2)
-
-    print(f"Cached splits → {len(train_subsets)} train subsets, "
-          f"val: {len(val_paths)}, test: {len(test_paths)}")
-    return train_subsets, val_paths, test_paths
-
+    
+    with open(splits_file, 'w') as f:
+        json.dump(splits, f, indent=2)
+    
+    print(f"Cached dataset splits to {splits_file}")
+    print(f"Train: {len(train_paths)}, Val: {len(val_paths)}, Test: {len(test_paths)}")
+    
+    return train_paths, val_paths, test_paths
 
 class TokenBudgetBatchSampler(BatchSampler):
     """
@@ -235,50 +229,24 @@ class TokenBudgetBatchSampler(BatchSampler):
     def __len__(self) -> int:
         return len(self.batches)
 
-
-def data_loader(config, tokenizer, cache_path, train_subset_index=None):
+# Update the data_loader function to use PreloadedDataset
+def data_loader(config, tokenizer, cache_path):
     block_size = config["block_size"]
     batch_size = config["batch_size"]
 
     # Load or create cached splits
-    subset_train_paths, val_paths, test_paths = create_and_cache_splits(config)
-    if train_subset_index is None:
-        # — skip any subsets we've already trained on (per run_mapping.json) —
-        runs_base    = Path(cache_path) / "runs"
-        mapping_file = runs_base / "run_mapping.json"
-        if mapping_file.exists():
-            with open(mapping_file, "r") as mf:
-                completed_map = json.load(mf)
-            completed_indices = {int(k) for k in completed_map.keys()}
-        else:
-            completed_indices = set()
-
-        # find indices not yet processed
-        all_indices     = list(range(len(subset_train_paths)))
-        available       = [i for i in all_indices if i not in completed_indices]
-        if not available:
-            print("All train subsets have been processed. Exiting.")
-            sys.exit(100)
-
-        # pick one remaining subset at random
-        train_subset_index = random.choice(available)
-    else:
-        train_subset_index = int(train_subset_index)
-    train_paths        = subset_train_paths[train_subset_index]
-    # shuffle the train paths
-    random.shuffle(train_paths)
-    print(f"Using train subset {train_subset_index}/{len(subset_train_paths)}: {len(train_paths)} files")
+    train_paths, val_paths, test_paths = create_and_cache_splits(config)
 
     pad_id = tokenizer.pad_token_id
-    print("Creating ChunkedDataset instances (with padding)...")
+    print("Creating ChunkedDataset instances...")
     train_ds = ChunkedDataset(train_paths, block_size=block_size, pad_token_id=pad_id)
     val_ds   = ChunkedDataset(val_paths,   block_size=block_size, pad_token_id=pad_id)
     test_ds  = ChunkedDataset(test_paths,  block_size=block_size, pad_token_id=pad_id)
 
     # Compute total tokens for each split
-    total_tokens_train = compute_total_tokens(train_ds)
-    total_tokens_val   = compute_total_tokens(val_ds)
-    total_tokens_test  = compute_total_tokens(test_ds)
+    total_tokens_train = sum(train_ds.block_lengths)
+    total_tokens_val   = sum(val_ds.block_lengths)
+    total_tokens_test  = sum(test_ds.block_lengths)
     print(f"Total tokens → train: {total_tokens_train:,}, val: {total_tokens_val:,}, test: {total_tokens_test:,}")
 
     # Print length of datasets
@@ -303,7 +271,7 @@ def data_loader(config, tokenizer, cache_path, train_subset_index=None):
     max_tokens = config.get("max_tokens", config["block_size"] * config["batch_size"])
     print(f"Creating DataLoader with dynamic token batching (max_tokens={max_tokens})...")
     lengths = train_ds.block_lengths
-    
+
     train_batch_sampler = TokenBudgetBatchSampler(
         lengths=lengths, 
         max_tokens=max_tokens, 
@@ -314,7 +282,8 @@ def data_loader(config, tokenizer, cache_path, train_subset_index=None):
     print(f"  → {len(train_batch_sampler)} batches, up to {max_tokens} tokens each")
     train_loader = DataLoader(
         train_ds,
-        batch_sampler=train_batch_sampler,
+        # batch_sampler=train_batch_sampler,
+        batch_size=config["batch_size"],
         num_workers=12,
         pin_memory=True,
         collate_fn=collate_fn_with_mask,
@@ -322,18 +291,18 @@ def data_loader(config, tokenizer, cache_path, train_subset_index=None):
     )
 
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                               num_workers=4, pin_memory=True,
-                               collate_fn=collate_fn_with_mask, prefetch_factor=2, drop_last=True)
+                               num_workers=2, pin_memory=True,
+                               collate_fn=collate_fn_with_mask, drop_last=True)
     test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
-                               num_workers=4, pin_memory=True,
-                               collate_fn=collate_fn_with_mask, prefetch_factor=2, drop_last=True)
+                               num_workers=2, pin_memory=True,
+                               collate_fn=collate_fn_with_mask, drop_last=True)
 
     print(f"Data preparation complete. "
           f"Train files: {len(train_paths)}, "
           f"Val files: {len(val_paths)}, "
           f"Test files: {len(test_paths)}")
 
-    return train_loader, val_loader, test_loader, collate_fn_with_mask, total_tokens_train, train_subset_index
+    return train_loader, val_loader, test_loader, collate_fn_with_mask, total_tokens_train
     # return val_loader, val_loader, test_loader, collate_fn, total_tokens_val
 
 if __name__ == "__main__":
