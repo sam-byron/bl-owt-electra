@@ -39,20 +39,6 @@ class EmptyDataset(Dataset):
     #    - embedding_size: size of the generator’s embeddings
     #    - hidden_size etc. define the discriminator
 def build_model(config, tokenizer):
-    # gen_config = ElectraConfig(
-    #     vocab_size=tokenizer.vocab_size,
-    #     embedding_size=config["embedding_size"],        # smaller generator
-    #     hidden_size=config["hidden_size"],           # discriminator hidden size
-    #     num_hidden_layers=config["num_hidden_layers"],      # discriminator depth
-    #     num_attention_heads=config["num_attention_heads"],  # number of attention heads
-    #     intermediate_size=config["intermediate_size"],  # size of the feedforward layer
-    #     max_position_embeddings=config["max_position_embeddings"],
-    #     generator_hidden_size=config["generator_hidden_size"], # generator depth = hidden_size / 3
-    #     generator_num_hidden_layers=config["generator_num_hidden_layers"],
-    #     layer_norm_eps=config["layer_norm_eps"],
-    #     hidden_dropout_prob=config["hidden_dropout_prob"],
-    #     attention_probs_dropout_prob=config["attention_probs_dropout_prob"],
-    # )
     gen_config = ElectraConfig.from_pretrained("google/electra-base-generator")
     disc_config = ElectraConfig.from_pretrained("google/electra-base-discriminator")
 
