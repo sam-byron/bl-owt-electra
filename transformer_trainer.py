@@ -39,20 +39,21 @@ class EmptyDataset(Dataset):
     #    - embedding_size: size of the generator’s embeddings
     #    - hidden_size etc. define the discriminator
 def build_model(config, tokenizer):
-    gen_config = ElectraConfig(
-        vocab_size=tokenizer.vocab_size,
-        embedding_size=config["embedding_size"],        # smaller generator
-        hidden_size=config["hidden_size"],           # discriminator hidden size
-        num_hidden_layers=config["num_hidden_layers"],      # discriminator depth
-        num_attention_heads=config["num_attention_heads"],  # number of attention heads
-        intermediate_size=config["intermediate_size"],  # size of the feedforward layer
-        max_position_embeddings=config["max_position_embeddings"],
-        generator_hidden_size=config["generator_hidden_size"], # generator depth = hidden_size / 3
-        generator_num_hidden_layers=config["generator_num_hidden_layers"],
-        layer_norm_eps=config["layer_norm_eps"],
-        hidden_dropout_prob=config["hidden_dropout_prob"],
-        attention_probs_dropout_prob=config["attention_probs_dropout_prob"],
-    )
+    # gen_config = ElectraConfig(
+    #     vocab_size=tokenizer.vocab_size,
+    #     embedding_size=config["embedding_size"],        # smaller generator
+    #     hidden_size=config["hidden_size"],           # discriminator hidden size
+    #     num_hidden_layers=config["num_hidden_layers"],      # discriminator depth
+    #     num_attention_heads=config["num_attention_heads"],  # number of attention heads
+    #     intermediate_size=config["intermediate_size"],  # size of the feedforward layer
+    #     max_position_embeddings=config["max_position_embeddings"],
+    #     generator_hidden_size=config["generator_hidden_size"], # generator depth = hidden_size / 3
+    #     generator_num_hidden_layers=config["generator_num_hidden_layers"],
+    #     layer_norm_eps=config["layer_norm_eps"],
+    #     hidden_dropout_prob=config["hidden_dropout_prob"],
+    #     attention_probs_dropout_prob=config["attention_probs_dropout_prob"],
+    # )
+    gen_config = ElectraConfig.from_pretrained("google/electra-base-generator")
     disc_config = ElectraConfig.from_pretrained("google/electra-base-discriminator")
 
     # 5. Instantiate ELECTRA for pretraining
@@ -97,6 +98,14 @@ def train_loop(
         processed_tokens = 0
         epoch_start = time.time()
 
+        # Join checkpoint path with "generator" and "discriminator"
+        gen_path = os.path.join(checkpoint_path, f"generator")
+        disc_path = os.path.join(checkpoint_path, f"discriminator")
+        tokenizer_path = os.path.join(checkpoint_path, "tokenizer")
+        os.makedirs(gen_path, exist_ok=True)
+        os.makedirs(disc_path, exist_ok=True)
+        os.makedirs(tokenizer_path, exist_ok=True)
+
         # Only the main process draws the bars
         is_main = accelerator.is_main_process
 
@@ -126,7 +135,7 @@ def train_loop(
             # for key in ("input_ids", "attention_mask"):
             #     batch[key] = accelerator.pad_across_processes(batch[key], dim=1)
 
-            with accelerator.accumulate(model):
+            with accelerator.accumulate(model, disc):
                 with accelerator.autocast():
                     mlm_labels = batch["labels"]
                     outputs = model(
@@ -169,14 +178,19 @@ def train_loop(
                     accelerator.backward(loss)
                         # Clip gradients to prevent them from exploding, a common cause of NaNs.
                     if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(model.parameters(), config["max_grad_norm"])
+                        # This is the recommended way to clip gradients with Accelerate
+                        # It unscales the gradients, clips them, and then scales them back.
+                        accelerator.clip_grad_norm_(
+                        list(model.parameters()) + list(disc.parameters()),
+                        config["max_grad_norm"]
+                    )
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
                     # local_sgd.step()
                     
                     # Gather and average loss across GPUs
-                    # loss = accelerator.gather(loss).mean()
+                    loss = accelerator.gather(loss).mean()
                     if loss.isnan() or loss.isinf():
                         # Print a warning and skip this step
                         if is_main:
@@ -190,37 +204,39 @@ def train_loop(
                 # accelerator.wait_for_everyone()
                 processed_tokens += 1
                 # print("Done gathering real tokens")
-                if is_main:
-                    # print("updating bars")
-                    token_bar.update(1)
-                    # Update loss bar
-                    loss_bar.update(1)
-                    loss_bar.set_postfix({
-                        "loss": f"{loss:.4f}",
-                        "avg_loss": f"{avg_loss:.4f}"
-                    })
-                    # Update token bar postfix with tok/s and ETA
-                    elapsed = time.time() - epoch_start
-                    tok_per_sec = processed_tokens / elapsed if elapsed > 0 else 0
-                    remaining = max(len(train_loader) - processed_tokens, 0)
-                    eta_sec = remaining / tok_per_sec if tok_per_sec > 0 else 0
-                    eta_str = str(datetime.timedelta(seconds=int(eta_sec)))
-                    token_bar.set_postfix({
-                        "tok/s": f"{tok_per_sec:.0f}",
-                        "ETA": eta_str
-                    })
+                # if is_main:
+                # print("updating bars")
+                token_bar.update(1)
+                # Update loss bar
+                loss_bar.update(1)
+                loss_bar.set_postfix({
+                    "loss": f"{loss:.4f}",
+                    "avg_loss": f"{avg_loss:.4f}"
+                })
+                # Update token bar postfix with tok/s and ETA
+                elapsed = time.time() - epoch_start
+                tok_per_sec = processed_tokens / elapsed if elapsed > 0 else 0
+                remaining = max(len(train_loader) - processed_tokens, 0)
+                eta_sec = remaining / tok_per_sec if tok_per_sec > 0 else 0
+                eta_str = str(datetime.timedelta(seconds=int(eta_sec)))
+                token_bar.set_postfix({
+                    "tok/s": f"{tok_per_sec:.0f}",
+                    "ETA": eta_str
+                })
                     # print("Done updating bars")
                 # accelerator.wait_for_everyone()
                 # ——— Periodic checkpointing every 30 min ———
                 current_time = time.time()
                 if current_time - last_checkpoint_time >= 10 * 60:
-                    accelerator.wait_for_everyone()
+                    # accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         accelerator.save_state(output_dir=checkpoint_path, safe_serialization=False)
-                        unwrapped = accelerator.unwrap_model(model)
-                        unwrapped.save_pretrained(checkpoint_path)
-                        tokenizer.save_pretrained(checkpoint_path)  # Save tokenizer to cache path
-                        print("[Checkpoint] Saved model state and optimizer")
+                        unwrapped_gen = accelerator.unwrap_model(model)
+                        unwrapped_disc = accelerator.unwrap_model(disc)
+                        unwrapped_gen.save_pretrained(gen_path)
+                        unwrapped_disc.save_pretrained(disc_path)
+                        tokenizer.save_pretrained(tokenizer_path)  # Save tokenizer to cache path
+                        print("[Checkpoint] Saved generator, discriminatorm and tokenizer")
                     accelerator.wait_for_everyone()
                     last_checkpoint_time = current_time
 
@@ -235,11 +251,14 @@ def train_loop(
         )
 
         # accelerator.wait_for_everyone()
-        accelerator.save_state(output_dir=checkpoint_path)
-        unwrapped = accelerator.unwrap_model(model)
-        unwrapped.save_pretrained(checkpoint_path)
-        tokenizer.save_pretrained(checkpoint_path)  # Save tokenizer to cache path
-        print("[Checkpoint] Saved model state and optimizer")
+        if accelerator.is_main_process:
+            accelerator.save_state(output_dir=checkpoint_path, safe_serialization=False)
+            unwrapped_gen = accelerator.unwrap_model(model)
+            unwrapped_disc = accelerator.unwrap_model(disc)
+            unwrapped_gen.save_pretrained(gen_path)
+            unwrapped_disc.save_pretrained(disc_path)
+            tokenizer.save_pretrained(tokenizer_path)  # Save tokenizer to cache path
+            print("[Checkpoint] Saved generator, discriminatorm and tokenizer")
 
 
 
@@ -308,19 +327,31 @@ def main():
         model, optimizer, train_loader, test_loader, val_loader, disc
     )
 
-     # —––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
-    # Print model architecture, parameter counts, and full size
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-    total_mb = total_bytes / (1024 ** 2)
-    print("===== Model Summary =====", flush=True)
-    print(model, flush=True)
-    print(f"Total parameters:     {total_params:,}", flush=True)
-    print(f"Trainable parameters: {trainable_params:,}", flush=True)
-    print(f"Approx. model size:   {total_mb:.2f} MB", flush=True)
-    print("==========================", flush=True)
-    # —––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+    if accelerator.is_main_process:
+        # —––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+        # Print model architecture, parameter counts, and full size
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+        total_mb = total_bytes / (1024 ** 2)
+        print("===== Model Summary =====", flush=True)
+        print(model, flush=True)
+        print(f"Total parameters:     {total_params:,}", flush=True)
+        print(f"Trainable parameters: {trainable_params:,}", flush=True)
+        print(f"Approx. model size:   {total_mb:.2f} MB", flush=True)
+        print("==========================", flush=True)
+        # —––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+        # Print discriminator architecture, parameter counts, and full size
+        total_disc_params = sum(p.numel() for p in disc.parameters())
+        trainable_disc_params = sum(p.numel() for p in disc.parameters() if p.requires_grad)
+        total_disc_bytes = sum(p.numel() * p.element_size() for p in disc.parameters())
+        total_disc_mb = total_disc_bytes / (1024 ** 2)
+        print("===== Discriminator Summary =====", flush=True)
+        print(disc, flush=True)
+        print(f"Total parameters:     {total_disc_params:,}", flush=True)
+        print(f"Trainable parameters: {trainable_disc_params:,}", flush=True)
+        print(f"Approx. model size:   {total_disc_mb:.2f} MB", flush=True)
+        print("==================================", flush=True) 
     
     # model = torch.compile(model, backend="inductor")
     scheduler = get_scheduler(
